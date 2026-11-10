@@ -12,8 +12,10 @@ an AgentCore Harness (not an AgentCore Runtime agent directly).
 """
 
 import asyncio
+import base64
+import binascii
 import concurrent.futures
-from typing import AsyncIterator, Iterator
+from typing import AsyncIterator, Iterator, Optional
 
 import boto3
 import botocore.config
@@ -28,9 +30,89 @@ QUALIFIER = "DEFAULT"
 # timeout to accommodate streamed agent responses (Req 4.4).
 READ_TIMEOUT_SECONDS = 300
 
+# Image formats accepted in the Converse-style "image" content block,
+# matching the subset of formats the Bedrock Converse API accepts.
+_SUPPORTED_IMAGE_FORMATS = {"png", "jpeg", "gif", "webp"}
 
-def _build_call_kwargs(arn: str, message: str, session_id: str) -> dict:
-    """Pure function: (arn, message, session_id) -> boto3 call kwargs.
+# Maps a data URL/base64 MIME subtype to the Converse API "format"
+# value. "jpg" is normalized to "jpeg" since the Converse API only
+# accepts "jpeg".
+_MIME_SUBTYPE_TO_FORMAT = {
+    "png": "png",
+    "jpeg": "jpeg",
+    "jpg": "jpeg",
+    "gif": "gif",
+    "webp": "webp",
+}
+
+
+class InvalidImageError(ValueError):
+    """Raised when an incoming image payload cannot be decoded or is in
+    an unsupported format."""
+
+
+def _decode_image(image: dict) -> dict:
+    """Decodes a single incoming image dict into a Converse-style
+    ``image`` content block.
+
+    Args:
+        image: A dict with keys ``data`` (base64-encoded image bytes,
+            optionally as a ``data:image/<format>;base64,...`` URL)
+            and optionally ``format`` (e.g. ``"png"``). If ``format``
+            is omitted, it is inferred from a ``data:`` URL prefix
+            when present.
+
+    Returns:
+        A Converse-style content block:
+        ``{"image": {"format": ..., "source": {"bytes": ...}}}``.
+
+    Raises:
+        InvalidImageError: If the base64 payload cannot be decoded or
+            the resolved format is not supported.
+    """
+    data = image.get("data", "")
+    fmt = image.get("format")
+
+    if data.startswith("data:"):
+        header, _, encoded = data.partition(",")
+        if fmt is None:
+            # header looks like "data:image/png;base64"
+            mime = header[len("data:"):].split(";")[0]
+            subtype = mime.split("/")[-1].lower()
+            fmt = _MIME_SUBTYPE_TO_FORMAT.get(subtype)
+        data = encoded
+    elif fmt is not None:
+        fmt = _MIME_SUBTYPE_TO_FORMAT.get(fmt.lower())
+
+    if fmt not in _SUPPORTED_IMAGE_FORMATS:
+        raise InvalidImageError(
+            f"Unsupported or missing image format: {image.get('format')!r}"
+        )
+
+    try:
+        image_bytes = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise InvalidImageError("Invalid base64 image data") from e
+
+    if not image_bytes:
+        raise InvalidImageError("Empty image data")
+
+    return {
+        "image": {
+            "format": fmt,
+            "source": {"bytes": image_bytes},
+        }
+    }
+
+
+def _build_call_kwargs(
+    arn: str,
+    message: str,
+    session_id: str,
+    images: Optional[list] = None,
+) -> dict:
+    """Pure function: (arn, message, session_id, images) -> boto3 call
+    kwargs.
 
     Builds the keyword arguments for the boto3 ``invoke_harness`` call
     without touching the network or any boto3 client instance, so it
@@ -40,8 +122,9 @@ def _build_call_kwargs(arn: str, message: str, session_id: str) -> dict:
     ``payload``), ``invoke_harness`` requires a structured
     ``messages`` list in the Converse-style shape: a list of
     ``{"role": ..., "content": [...]}`` dicts, where each content
-    block is a tagged union (here, a single ``{"text": ...}`` block
-    carrying the user's message verbatim).
+    block is a tagged union: a ``{"text": ...}`` block carrying the
+    user's message verbatim, followed by one ``{"image": ...}`` block
+    per entry in ``images`` (when provided).
 
     Args:
         arn: The configured AgentCore Harness ARN
@@ -49,11 +132,21 @@ def _build_call_kwargs(arn: str, message: str, session_id: str) -> dict:
             AgentCore Runtime ``runtime/...`` ARN).
         message: The user's message text.
         session_id: The Session_Id to forward as ``runtimeSessionId``.
+        images: Optional list of image dicts (see ``_decode_image``)
+            to attach as additional content blocks.
 
     Returns:
         A dict with keys ``harnessArn``, ``qualifier``,
         ``runtimeSessionId``, and ``messages``.
+
+    Raises:
+        InvalidImageError: If any entry in ``images`` cannot be
+            decoded or is in an unsupported format.
     """
+    content = [{"text": message}]
+    for image in images or []:
+        content.append(_decode_image(image))
+
     return {
         "harnessArn": arn,
         "qualifier": QUALIFIER,
@@ -61,7 +154,7 @@ def _build_call_kwargs(arn: str, message: str, session_id: str) -> dict:
         "messages": [
             {
                 "role": "user",
-                "content": [{"text": message}],
+                "content": content,
             }
         ],
     }
@@ -143,7 +236,10 @@ class AgentClient:
         )
 
     async def invoke_stream(
-        self, message: str, session_id: str
+        self,
+        message: str,
+        session_id: str,
+        images: Optional[list] = None,
     ) -> AsyncIterator[str]:
         """Invoke AgentCore Harness and yield decoded text chunks.
 
@@ -158,18 +254,24 @@ class AgentClient:
             message: The user's message text.
             session_id: The Session_Id to forward as
                 ``runtimeSessionId``.
+            images: Optional list of image dicts (base64 payload plus
+                format) to attach as additional content blocks.
 
         Yields:
             Decoded text chunks from the AgentCore Harness response
             stream, in order.
 
         Raises:
+            InvalidImageError: If any entry in ``images`` cannot be
+                decoded or is in an unsupported format.
             AgentClientTimeoutError: If the underlying boto3 call
                 times out (Req 5.2).
             AgentClientError: If the underlying boto3 call raises any
                 other client/service error (Req 5.1).
         """
-        kwargs = _build_call_kwargs(self._harness_arn, message, session_id)
+        kwargs = _build_call_kwargs(
+            self._harness_arn, message, session_id, images
+        )
         loop = asyncio.get_event_loop()
 
         try:

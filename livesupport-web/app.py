@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import sys
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import boto3
 import dotenv
@@ -23,7 +23,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from agent_client import AgentClient, AgentClientError, AgentClientTimeoutError
+from agent_client import (
+    AgentClient,
+    AgentClientError,
+    AgentClientTimeoutError,
+    InvalidImageError,
+)
 from rate_limiter import get_client_key, is_allowed
 
 logger = logging.getLogger(__name__)
@@ -35,12 +40,52 @@ dotenv.load_dotenv()
 # (Req 3.5).
 MIN_SESSION_ID_LENGTH = 33
 
+# Default cap on images per /api/chat request if MAX_IMAGES_PER_MESSAGE
+# is unset.
+DEFAULT_MAX_IMAGES_PER_MESSAGE = 3
+
+
+def _get_support_image() -> bool:
+    """Reads SUPPORT_IMAGE from the environment; disabled by default.
+
+    Image paste/upload support stays off unless explicitly enabled, so
+    deployments pointed at a non-vision model don't silently accept
+    image input.
+    """
+    return os.environ.get("SUPPORT_IMAGE", "0") == "1"
+
+
+def _get_max_images_per_message() -> int:
+    """Reads MAX_IMAGES_PER_MESSAGE from the environment, with a
+    default."""
+    value = os.environ.get("MAX_IMAGES_PER_MESSAGE")
+    if not value:
+        return DEFAULT_MAX_IMAGES_PER_MESSAGE
+    return int(value)
+
+
+SUPPORT_IMAGE = _get_support_image()
+MAX_IMAGES_PER_MESSAGE = _get_max_images_per_message()
+
+
+class ChatImage(BaseModel):
+    """A single image attached to a chat message.
+
+    ``data`` is base64-encoded image bytes, optionally as a
+    ``data:image/<format>;base64,...`` URL (in which case ``format``
+    may be omitted and is inferred from the URL).
+    """
+
+    data: str
+    format: Optional[str] = None
+
 
 class ChatRequest(BaseModel):
     """Request body for POST /api/chat."""
 
     message: str
     session_id: str
+    images: Optional[list[ChatImage]] = None
 
 
 def _validate_session_id(session_id: str) -> None:
@@ -64,6 +109,40 @@ def _validate_session_id(session_id: str) -> None:
             detail=(
                 "session_id is required and must be at least "
                 f"{MIN_SESSION_ID_LENGTH} characters"
+            ),
+        )
+
+
+def _validate_images(images: Optional[list[ChatImage]]) -> None:
+    """Validates incoming images against the SUPPORT_IMAGE feature flag
+    and the configured per-message image cap.
+
+    Raises an HTTPException with a 400 status code if images are
+    supplied while SUPPORT_IMAGE is disabled, or if more than
+    MAX_IMAGES_PER_MESSAGE images are supplied.
+
+    Args:
+        images: The images list from the incoming request, if any.
+
+    Raises:
+        HTTPException: 400 status code if images are not supported or
+            the count exceeds the configured maximum.
+    """
+    if not images:
+        return
+
+    if not SUPPORT_IMAGE:
+        raise HTTPException(
+            status_code=400,
+            detail="Image input is not supported by this deployment.",
+        )
+
+    if len(images) > MAX_IMAGES_PER_MESSAGE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"At most {MAX_IMAGES_PER_MESSAGE} image(s) are allowed "
+                "per message."
             ),
         )
 
@@ -175,7 +254,9 @@ def _format_sse(data: object) -> str:
 
 
 async def _sse_event_stream(
-    message: str, session_id: str
+    message: str,
+    session_id: str,
+    images: Optional[list] = None,
 ) -> AsyncIterator[str]:
     """Streams the agent's response as SSE events, mapping errors safely.
 
@@ -185,22 +266,37 @@ async def _sse_event_stream(
     a single SSE error event with a generic timeout message distinct
     from generic errors, omitting the original exception
     message/traceback (Req 5.1, 5.2). If the call raises
-    AgentClientError or any other unexpected Exception, logs full
-    details server-side only and yields a single generic SSE error
-    event (Req 5.1). In all cases, the generator returns once
-    exhausted or after yielding an error event, closing the
-    StreamingResponse stream (Req 2.5).
+    InvalidImageError (a malformed/undecodable image slipped past
+    request-level validation), yields a single SSE error event citing
+    the bad image input. If the call raises AgentClientError or any
+    other unexpected Exception, logs full details server-side only and
+    yields a single generic SSE error event (Req 5.1). In all cases,
+    the generator returns once exhausted or after yielding an error
+    event, closing the StreamingResponse stream (Req 2.5).
 
     Args:
         message: The user's chat message.
         session_id: The conversation's Session_Id.
+        images: Optional list of image dicts to attach to the message.
 
     Yields:
         SSE-formatted event strings.
     """
     try:
-        async for chunk in agent_client.invoke_stream(message, session_id):
+        async for chunk in agent_client.invoke_stream(
+            message, session_id, images
+        ):
             yield _format_sse(chunk)
+    except InvalidImageError:
+        logger.exception("Invalid image payload in chat request")
+        yield _format_sse(
+            {
+                "error": "invalid_image",
+                "message": "One of the attached images could not be "
+                "processed. Please try a different image.",
+            }
+        )
+        return
     except AgentClientTimeoutError:
         logger.exception("AgentClient invocation timed out")
         yield _format_sse(
@@ -250,10 +346,12 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             client's IP for rate limiting.
 
     Raises:
-        HTTPException: 400 if session_id is missing/too short; 429 if
-            the Rate_Limiter rejects the request.
+        HTTPException: 400 if session_id is missing/too short, or if
+            images are supplied while unsupported/over the configured
+            cap; 429 if the Rate_Limiter rejects the request.
     """
     _validate_session_id(req.session_id)
+    _validate_images(req.images)
 
     client_ip = request.client.host if request.client else None
     client_key = get_client_key(client_ip)
@@ -263,10 +361,29 @@ async def chat(req: ChatRequest, request: Request) -> StreamingResponse:
             detail="Rate limit exceeded. Please slow down and try again.",
         )
 
+    images = (
+        [image.model_dump() for image in req.images] if req.images else None
+    )
+
     return StreamingResponse(
-        _sse_event_stream(req.message, req.session_id),
+        _sse_event_stream(req.message, req.session_id, images),
         media_type="text/event-stream",
     )
+
+
+@app.get("/api/config")
+def get_config() -> dict:
+    """Exposes feature-flag configuration needed by the frontend.
+
+    Lets the chat UI know whether image paste/upload should be shown
+    and how many images are allowed per message, without hardcoding
+    those values in static/chat.js (Req: SUPPORT_IMAGE,
+    MAX_IMAGES_PER_MESSAGE).
+    """
+    return {
+        "support_image": SUPPORT_IMAGE,
+        "max_images_per_message": MAX_IMAGES_PER_MESSAGE,
+    }
 
 
 # Mounted at "/" (not "/static") so that static/index.html's relative

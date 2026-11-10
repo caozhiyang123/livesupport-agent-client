@@ -10,6 +10,164 @@ const MIN_SESSION_ID_LENGTH = 33;
 // conversation. `null` means no Session_Id has been generated yet.
 let sessionId = null;
 
+// Feature-flag state fetched from GET /api/config. Image paste/upload stays
+// disabled until confirmed enabled server-side (SUPPORT_IMAGE), so the UI
+// never shows image affordances the backend will just reject.
+let imageConfig = { support_image: false, max_images_per_message: 3 };
+
+// Pending images (data URLs) attached to the message currently being
+// composed, cleared after each send.
+let pendingImages = [];
+
+/**
+ * Fetches image-support feature-flag configuration from GET /api/config
+ * and stores it in module state for use by paste/drop handlers and
+ * sendMessage.
+ *
+ * @returns {Promise<{support_image: boolean, max_images_per_message: number}>}
+ */
+async function loadImageConfig() {
+  try {
+    const response = await fetch("/api/config");
+    if (response.ok) {
+      const data = await response.json();
+      imageConfig = {
+        support_image: Boolean(data.support_image),
+        max_images_per_message: Number(data.max_images_per_message) || 3,
+      };
+    }
+  } catch (e) {
+    // Network error fetching config: leave the default (disabled) in
+    // place rather than failing the whole page load.
+  }
+  return imageConfig;
+}
+
+/**
+ * Converts a File/Blob (e.g. a pasted or dropped image) into a base64
+ * data URL (`data:image/<format>;base64,...`).
+ *
+ * @param {Blob} file the image file/blob to encode
+ * @returns {Promise<string>} the resulting data URL
+ */
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
+ * Adds a newly selected/pasted/dropped image file to `pendingImages`,
+ * enforcing `imageConfig.max_images_per_message`, and renders its
+ * thumbnail preview.
+ *
+ * Silently ignores non-image files and does nothing if image support is
+ * disabled or the per-message cap has already been reached.
+ *
+ * @param {File} file the image file/blob to add
+ * @returns {Promise<void>}
+ */
+async function addPendingImage(file) {
+  if (!imageConfig.support_image) {
+    return;
+  }
+  if (!file || !file.type || !file.type.startsWith("image/")) {
+    return;
+  }
+  if (pendingImages.length >= imageConfig.max_images_per_message) {
+    return;
+  }
+
+  const dataUrl = await fileToDataUrl(file);
+  pendingImages.push(dataUrl);
+  renderImagePreviews();
+}
+
+/**
+ * Removes a pending image by index and re-renders the preview strip.
+ *
+ * @param {number} index index into `pendingImages` to remove
+ * @returns {void}
+ */
+function removePendingImage(index) {
+  pendingImages.splice(index, 1);
+  renderImagePreviews();
+}
+
+/**
+ * Renders thumbnail previews of all `pendingImages` into
+ * `#image-preview-row`, each with a small remove ("x") control.
+ *
+ * No-op outside a browser DOM (e.g. under Node-based tests).
+ *
+ * @returns {void}
+ */
+function renderImagePreviews() {
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const row = document.getElementById("image-preview-row");
+  if (!row) {
+    return;
+  }
+
+  row.innerHTML = "";
+  if (pendingImages.length === 0) {
+    row.style.display = "none";
+    return;
+  }
+  row.style.display = "flex";
+
+  pendingImages.forEach((dataUrl, index) => {
+    const wrapper = document.createElement("div");
+    wrapper.className = "image-preview-thumb";
+
+    const img = document.createElement("img");
+    img.src = dataUrl;
+    wrapper.appendChild(img);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "image-preview-remove";
+    removeBtn.textContent = "\u00D7"; // ×
+    removeBtn.setAttribute("aria-label", "Remove image");
+    removeBtn.addEventListener("click", () => removePendingImage(index));
+    wrapper.appendChild(removeBtn);
+
+    row.appendChild(wrapper);
+  });
+}
+
+/**
+ * Splits a base64 data URL into the Backend's expected
+ * `{ data, format }` image payload shape.
+ *
+ * @param {string} dataUrl a `data:image/<format>;base64,...` URL
+ * @returns {{data: string, format: string|undefined}}
+ */
+function dataUrlToImagePayload(dataUrl) {
+  const match = /^data:image\/([a-zA-Z0-9.+-]+);base64,(.*)$/.exec(dataUrl);
+  if (!match) {
+    return { data: dataUrl, format: undefined };
+  }
+  return { data: match[2], format: match[1] };
+}
+
+/**
+ * Clears all pending images (e.g. after a successful send or when
+ * starting a new conversation).
+ *
+ * @returns {void}
+ */
+function clearPendingImages() {
+  pendingImages = [];
+  renderImagePreviews();
+}
+
 /**
  * Fallback UUID v4 generator used when `crypto.randomUUID` is unavailable
  * (e.g. the page is served over plain HTTP from a non-localhost origin,
@@ -96,6 +254,7 @@ function getOrCreateSessionId() {
  */
 function startNewConversation() {
   sessionId = createSessionId();
+  clearPendingImages();
   return sessionId;
 }
 
@@ -117,24 +276,39 @@ function isBlank(message) {
  * Requirement 1.1: a non-empty message is sent as an HTTP POST to
  * `/api/chat` containing the exact message text and the current Session_Id.
  * Requirement 1.2: blank (empty/whitespace-only) messages short-circuit
- * without sending any request.
+ * without sending any request, UNLESS at least one image is attached (an
+ * image-only message with no text is still sendable when image support is
+ * enabled).
  * Requirement 3.2: the current Session_Id (obtained via
  * getOrCreateSessionId, generating one if none exists yet) is included so
  * that conversation continuity is maintained.
+ *
+ * When `pendingImages` is non-empty, each pending image (a base64 data URL)
+ * is split into the Backend's `{ data, format }` shape and included as an
+ * `images` array on the request body; pending images are cleared after the
+ * request is issued regardless of outcome, so a failed send doesn't leave
+ * stale images attached to the next message.
  *
  * @param {string} message the message text to send
  * @returns {Promise<void>}
  */
 async function sendMessage(message) {
-  if (isBlank(message)) {
+  const images = pendingImages.slice();
+
+  if (isBlank(message) && images.length === 0) {
     return;
   }
 
-  renderUserMessage(message);
+  renderUserMessage(message, images);
+  clearPendingImages();
 
   const body = JSON.stringify({
     message,
     session_id: getOrCreateSessionId(),
+    images:
+      images.length > 0
+        ? images.map(dataUrlToImagePayload)
+        : undefined,
   });
 
   const response = await fetch("/api/chat", {
@@ -233,17 +407,34 @@ function _createMessageRow(role) {
  * Renders a user-submitted message as its own bubble in `#message-list`.
  *
  * User messages are shown as plain escaped text (not Markdown-rendered),
- * since the user's own input should display exactly as typed.
+ * since the user's own input should display exactly as typed. Any attached
+ * images are rendered as thumbnails above the text.
  *
  * @param {string} text the user's message text
+ * @param {string[]} [images] data URLs of images attached to this message
  * @returns {void}
  */
-function renderUserMessage(text) {
+function renderUserMessage(text, images) {
   const bubble = _createMessageRow("user");
   if (!bubble) {
     return;
   }
-  bubble.textContent = text;
+
+  if (images && images.length > 0) {
+    const imageRow = document.createElement("div");
+    imageRow.className = "message-image-row";
+    images.forEach((dataUrl) => {
+      const img = document.createElement("img");
+      img.src = dataUrl;
+      img.className = "message-image-thumb";
+      imageRow.appendChild(img);
+    });
+    bubble.appendChild(imageRow);
+  }
+
+  const textNode = document.createElement("div");
+  textNode.textContent = text;
+  bubble.appendChild(textNode);
 }
 
 /**
@@ -525,6 +716,13 @@ if (typeof module !== "undefined" && module.exports) {
     renderAgentMessage,
     renderError,
     renderIncomplete,
+    loadImageConfig,
+    fileToDataUrl,
+    addPendingImage,
+    removePendingImage,
+    renderImagePreviews,
+    dataUrlToImagePayload,
+    clearPendingImages,
   };
 }
 
