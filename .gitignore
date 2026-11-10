@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment / secrets - never commit real credentials or ARNs
+.env
+*.env
+!.env.example
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Node (if any frontend tooling is added later)
+node_modules/
+
+# Build / distribution artifacts
+dist/
+build/
+*.egg-info/
+
+# Archives created for manual deployment uploads
+*.zip
+*.tar.gz

@@ -1,0 +1,43 @@
+# systemd unit file template for LiveSupport Web Chat
+#
+# Install:
+#   sudo cp deploy/livesupport-web.service /etc/systemd/system/livesupport-web.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now livesupport-web
+#
+# This file documents how the FastAPI app (app.py) is run via uvicorn on the
+# host, which non-root user it runs as, where its environment file lives, and
+# how it should be restarted on failure. Adjust paths/ports to match your
+# deployment before installing. Requirement: 8.3.
+
+[Unit]
+Description=LiveSupport Web Chat (FastAPI/uvicorn)
+After=network.target
+
+[Service]
+# Non-root service user/group the app runs as. Create with:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin livesupport
+User=livesupport
+Group=livesupport
+
+# Directory containing app.py, agent_client.py, static/, and the venv.
+WorkingDirectory=/opt/livesupport-web
+
+# Environment file holding AGENT_RUNTIME_ARN, AWS_REGION,
+# RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS (see .env.example).
+# Must NOT be world-readable; owned by the livesupport user.
+EnvironmentFile=/opt/livesupport-web/.env
+
+# Run the FastAPI app via uvicorn, bound to localhost only; nginx (see
+# deploy/nginx-livesupport.conf) terminates TLS and reverse-proxies to this
+# address. Update the path to uvicorn if using a virtualenv, e.g.
+# /opt/livesupport-web/venv/bin/uvicorn.
+ExecStart=/opt/livesupport-web/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8008
+
+# Restart policy: restart the service automatically on failure, with a short
+# delay to avoid tight crash loops.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
